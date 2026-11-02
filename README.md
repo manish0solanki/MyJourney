@@ -13,6 +13,8 @@ A private, password-protected conception journal for couples: it predicts the fe
 - **Encrypted backup/restore** to move to another phone.
 
 ## Use it
+**Vercel:** vercel.com → Add New → Project → import `MyJourney` → Framework preset "Other", no build command → Deploy. Security headers are set in `vercel.json`.
+
 Open `index.html` in a browser, or host free on **GitHub Pages** (Settings → Pages → deploy from this branch) and open it on your phone, then "Add to Home Screen".
 
 > ⚠️ There is no password reset. If you forget it, the data can't be recovered — download backups regularly.
