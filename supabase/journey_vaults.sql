@@ -1,0 +1,7 @@
+-- Applied to the Supabase project as migration "journey_vaults_sync".
+-- Kept here for reference / re-creating the backend.
+-- Table: public.journey_vaults (RLS on, no policies, no grants => not readable via the Data API).
+-- Functions (SECURITY DEFINER, search_path=''): journey_pull, journey_push, journey_delete.
+-- Each checks sha256(token) against token_hash, where token = PBKDF2(password, "obp-sync:"+id).
+-- journey_push uses optimistic concurrency (p_expected version) and returns -1 on conflict.
+-- See the full SQL in the project migration history.

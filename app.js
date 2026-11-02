@@ -2,8 +2,8 @@
  * Our Baby Plan — a private, offline, password-protected conception journal.
  *
  * Privacy model:
- *  - All data lives only in this browser's localStorage. Nothing is sent anywhere
- *    (the page's Content-Security-Policy blocks all network connections).
+ *  - All data lives in this browser's localStorage. If sync is turned on, only the
+ *    encrypted vault is uploaded (to Supabase) so the partner's phone can fetch it.
  *  - Data is encrypted with AES-256-GCM using a key derived from your password
  *    (PBKDF2-SHA256, 310,000 iterations). Without the password the data is unreadable.
  *  - The password itself is never stored. If it is forgotten, the data cannot be recovered.
@@ -119,17 +119,270 @@ function normalise(data) {
   d.periods = Array.isArray(d.periods) ? d.periods.filter((p) => p && isDate(p.start)) : [];
   d.days = d.days && typeof d.days === 'object' ? d.days : {};
   d.checklist = d.checklist && typeof d.checklist === 'object' ? d.checklist : {};
+  // migrate v1 habit maps to flat, individually timestamped "hb_<id>" fields
+  for (const day of Object.values(d.days)) {
+    if (day && day.habits && typeof day.habits === 'object') {
+      for (const [id, v] of Object.entries(day.habits)) if (v) day['hb_' + id] = true;
+      delete day.habits;
+    }
+  }
   return d;
 }
 
-function save() {
+/* ---------- Mergeable edits ----------
+ * Every field change records a timestamp in obj._t so that two phones editing at the
+ * same time can be merged field-by-field (newest change wins) instead of overwriting
+ * each other. Periods are keyed by start date and use a deletion marker ("del"). */
+function setF(obj, k, v) {
+  obj[k] = v;
+  (obj._t || (obj._t = {}))[k] = Date.now();
+}
+function setMany(obj, values) {
+  for (const [k, v] of Object.entries(values)) if (JSON.stringify(obj[k]) !== JSON.stringify(v)) setF(obj, k, v);
+}
+const livePeriods = () => (S ? S.data.periods.filter((p) => !p.del) : []);
+function removePeriod(start) {
+  const p = S.data.periods.find((x) => x.start === start);
+  if (p) { p.del = true; p._u = Date.now(); }
+}
+
+function mergeRec(x, y) {
+  x = x || {}; y = y || {};
+  const tx = x._t || {}, ty = y._t || {};
+  const out = {}, t = {};
+  const keys = new Set([...Object.keys(x), ...Object.keys(y)]);
+  keys.delete('_t');
+  for (const k of keys) {
+    const a = tx[k] || 0, b = ty[k] || 0;
+    const useY = b > a ? k in y : !(k in x);
+    out[k] = useY ? y[k] : x[k];
+    if (Math.max(a, b)) t[k] = Math.max(a, b);
+  }
+  out._t = t;
+  return out;
+}
+
+/** Merge two journals. `local` keeps its own sync settings. */
+function mergeData(local, remote) {
+  local = normalise(local); remote = normalise(remote);
+  const out = normalise(remote);
+  out.profile = mergeRec(local.profile, remote.profile);
+  out.checklist = mergeRec(local.checklist, remote.checklist);
+  out.days = {};
+  for (const k of new Set([...Object.keys(local.days), ...Object.keys(remote.days)])) out.days[k] = mergeRec(local.days[k], remote.days[k]);
+  const pm = {};
+  for (const p of [...remote.periods, ...local.periods]) {
+    const q = pm[p.start];
+    if (!q || (p._u || 0) > (q._u || 0)) pm[p.start] = p;
+  }
+  out.periods = Object.values(pm).sort((a, b) => (a.start < b.start ? -1 : 1));
+  out.created = minD(local.created || today(), remote.created || today());
+  out.sync = local.sync;
+  if (!out.sync) delete out.sync;
+  return out;
+}
+
+function save(opts = {}) {
   if (!S) return Promise.resolve();
   const snap = { key: S.key, salt: S.salt, iter: S.iter, data: JSON.parse(JSON.stringify(S.data)) };
   saveChain = saveChain
     .then(() => sealVault(snap.key, snap.salt, snap.iter, snap.data))
     .then((v) => localStorage.setItem(VAULT_KEY, JSON.stringify(v)))
     .catch((e) => { console.error(e); toast('Could not save — storage may be full or blocked'); });
+  if (!opts.fromSync && S.data.sync) { markDirty(); scheduleSync(); }
   return saveChain;
+}
+
+/* =========================================================
+ * Sync between phones (end-to-end encrypted)
+ *
+ * The encrypted vault (same AES key as on the phone) is stored in Supabase.
+ * The server only ever sees ciphertext. Access to a vault needs its random
+ * sync code AND a token derived from the journal password (PBKDF2), checked
+ * server-side by the journey_pull / journey_push functions.
+ * ======================================================= */
+const SB_URL = 'https://fzazdrzlemmkqngvpzxj.supabase.co';
+const SB_KEY = 'sb_publishable_PXXly0ZAeBTmXXG7KbPYoA_RB8HqVZq';
+const SYNC_VER_KEY = 'obp.sync.version';
+const SYNC_DIRTY_KEY = 'obp.sync.dirty';
+const sync = { busy: false, again: false, timer: null, status: 'off', last: 0, error: '', seq: 0 };
+
+const getVer = () => { try { return +localStorage.getItem(SYNC_VER_KEY) || 0; } catch { return 0; } };
+const setVer = (v) => { try { localStorage.setItem(SYNC_VER_KEY, String(v)); } catch { /* ignore */ } };
+const isDirty = () => { try { return localStorage.getItem(SYNC_DIRTY_KEY) === '1'; } catch { return true; } };
+function markDirty() { sync.seq++; try { localStorage.setItem(SYNC_DIRTY_KEY, '1'); } catch { /* ignore */ } }
+function clearDirty() { try { localStorage.removeItem(SYNC_DIRTY_KEY); } catch { /* ignore */ } }
+
+async function rpc(fn, body) {
+  const r = await fetch(`${SB_URL}/rest/v1/rpc/${fn}`, {
+    method: 'POST',
+    headers: { apikey: SB_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const j = await r.json().catch(() => null);
+  if (!r.ok) {
+    const e = new Error((j && j.message) || `Server error ${r.status}`);
+    e.code = j && j.code;
+    throw e;
+  }
+  return j;
+}
+
+async function syncToken(password, id) {
+  const base = await crypto.subtle.importKey('raw', new TextEncoder().encode(password), 'PBKDF2', false, ['deriveBits']);
+  const bits = await crypto.subtle.deriveBits(
+    { name: 'PBKDF2', salt: new TextEncoder().encode(`obp-sync:${id}`), iterations: PBKDF2_ITER, hash: 'SHA-256' }, base, 256);
+  return [...new Uint8Array(bits)].map((x) => x.toString(16).padStart(2, '0')).join('');
+}
+
+async function decryptRow(key, row) {
+  const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: unb64(row.iv) }, key, unb64(row.ct));
+  return JSON.parse(new TextDecoder().decode(pt));
+}
+
+function setSyncStatus(status, error = '') {
+  sync.status = status; sync.error = error;
+  if (status === 'ok') sync.last = Date.now();
+  const el = document.getElementById('syncBadge');
+  if (el) el.outerHTML = syncBadge();
+  const st = document.getElementById('syncState');
+  if (st) st.innerHTML = syncStateText();
+}
+
+function syncBadge() {
+  if (!S || !S.data.sync) return '<span id="syncBadge"></span>';
+  const m = { ok: ['☁️', 'Synced'], busy: ['🔄', 'Syncing…'], offline: ['📴', 'Offline — will sync later'], error: ['⚠️', 'Sync problem'], reconnect: ['⚠️', 'Sync needs your password'], off: ['☁️', 'Sync on'] }[sync.status] || ['☁️', ''];
+  return `<button id="syncBadge" class="btn small ghost" data-view="settings" title="${esc(m[1])}" aria-label="${esc(m[1])}">${m[0]}</button>`;
+}
+
+function syncStateText() {
+  const m = {
+    ok: `✅ Up to date${sync.last ? ` · last synced ${new Date(sync.last).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' })}` : ''}`,
+    busy: '🔄 Syncing…',
+    offline: '📴 No internet — changes are saved on this phone and will sync automatically.',
+    error: `⚠️ ${esc(sync.error || 'Could not sync')}`,
+    reconnect: '⚠️ The journal password was changed on the other phone. Enter the new password below to reconnect.',
+    off: 'Waiting to sync…',
+  };
+  return m[sync.status] || '';
+}
+
+function scheduleSync(delay = 1500) {
+  clearTimeout(sync.timer);
+  sync.timer = setTimeout(syncNow, delay);
+}
+
+/** Pull partner changes, merge, and push ours. Safe to call at any time. */
+async function syncNow() {
+  if (!S || !S.data.sync || sync.status === 'reconnect') return;
+  if (sync.busy) { sync.again = true; return; }
+  if (!navigator.onLine) { setSyncStatus('offline'); return; }
+  sync.busy = true; sync.again = false;
+  setSyncStatus('busy');
+  let changedFromRemote = false;
+  try {
+    for (let attempt = 0; attempt < 5; attempt++) {
+      const { id, token } = S.data.sync;
+      const ver = getVer();
+      const rows = await rpc('journey_pull', { p_id: id, p_token: token, p_since: ver });
+      if (!S || !S.data.sync) return;
+      let expected;
+      if (!rows.length) {
+        if (ver > 0) { // cloud copy was deleted from the other phone
+          delete S.data.sync; setVer(0); clearDirty();
+          await save({ fromSync: true });
+          toast('Sync was turned off from the other phone');
+          render();
+          return;
+        }
+        expected = 0;
+      } else {
+        const row = rows[0];
+        if (row.ct) {
+          if (row.salt !== b64(S.salt) || row.iter !== S.iter) { setSyncStatus('reconnect'); return; }
+          const remote = await decryptRow(S.key, row);
+          const before = JSON.stringify(S.data);
+          S.data = mergeData(S.data, remote);
+          if (JSON.stringify(S.data) !== before) changedFromRemote = true;
+          ENG = null;
+          await save({ fromSync: true });
+        }
+        setVer(row.version);
+        expected = row.version;
+      }
+      if (rows.length && !isDirty()) break;
+      const seq = sync.seq;
+      const v = await sealVault(S.key, S.salt, S.iter, S.data);
+      const nv = await rpc('journey_push', { p_id: id, p_token: token, p_expected: expected, p_salt: v.salt, p_iter: v.iter, p_iv: v.iv, p_ct: v.ct });
+      if (nv === -1) continue; // the other phone saved first — pull again and merge
+      setVer(nv);
+      if (seq === sync.seq) clearDirty();
+      break;
+    }
+    setSyncStatus('ok');
+  } catch (e) {
+    console.error(e);
+    if (e.code === '28000') setSyncStatus('reconnect');
+    else if (!navigator.onLine || e instanceof TypeError) setSyncStatus('offline');
+    else setSyncStatus('error', e.message);
+  } finally {
+    sync.busy = false;
+    if (changedFromRemote && S) {
+      const a = document.activeElement;
+      const typing = a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.closest('form');
+      if (typing) toast('New updates from your partner’s phone');
+      else { render(); toast('Updated from your partner’s phone 💞'); }
+    }
+    if (sync.again && S) scheduleSync(300);
+  }
+}
+
+setInterval(() => { if (S && S.data.sync && document.visibilityState === 'visible') syncNow(); }, 30000);
+document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible' && S && S.data.sync) syncNow(); });
+window.addEventListener('online', () => { if (S && S.data.sync) syncNow(); });
+
+/** Turn on sync from this phone: uploads the journal and creates a new sync code. */
+async function enableSync(password) {
+  await openVault(loadVault(), password); // verifies the password (throws if wrong)
+  const id = crypto.randomUUID ? crypto.randomUUID() : [...crypto.getRandomValues(new Uint8Array(16))].map((x, i) => (i === 6 ? (x & 15) | 64 : i === 8 ? (x & 63) | 128 : x).toString(16).padStart(2, '0')).join('').replace(/^(.{8})(.{4})(.{4})(.{4})/, '$1-$2-$3-$4-');
+  const token = await syncToken(password, id);
+  S.data.sync = { id, token };
+  const v = await sealVault(S.key, S.salt, S.iter, S.data);
+  const nv = await rpc('journey_push', { p_id: id, p_token: token, p_expected: 0, p_salt: v.salt, p_iter: v.iter, p_iv: v.iv, p_ct: v.ct });
+  if (nv < 1) throw new Error('Could not create the shared journal. Please try again.');
+  setVer(nv); clearDirty();
+  await save({ fromSync: true });
+  setSyncStatus('ok');
+}
+
+/** Fetch and decrypt a partner's shared journal using its sync code + password. */
+async function fetchShared(code, password) {
+  const id = code.trim().toLowerCase();
+  if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(id)) throw new Error('That sync code doesn’t look right — copy it again from the other phone.');
+  const token = await syncToken(password, id);
+  let rows;
+  try { rows = await rpc('journey_pull', { p_id: id, p_token: token, p_since: 0 }); }
+  catch (e) { if (e.code === '28000') throw new Error('Wrong password for this shared journal.'); throw new Error(navigator.onLine ? e.message : 'No internet connection.'); }
+  if (!rows.length) throw new Error('No shared journal found for this code.');
+  const row = rows[0];
+  const salt = unb64(row.salt);
+  const key = await deriveKey(password, salt, row.iter);
+  let data;
+  try { data = await decryptRow(key, row); } catch { throw new Error('Wrong password for this shared journal.'); }
+  return { key, salt, iter: row.iter, data: normalise(data), version: row.version, id, token };
+}
+
+/** Join (or reconnect to) a shared journal, merging in anything already on this phone. */
+async function joinShared(code, password) {
+  const r = await fetchShared(code, password);
+  const merged = S ? mergeData(S.data, r.data) : r.data;
+  merged.sync = { id: r.id, token: r.token };
+  S = { key: r.key, salt: r.salt, iter: r.iter, data: merged };
+  setVer(r.version);
+  markDirty(); // push anything merged in from this phone
+  sync.status = 'off';
+  await save({ fromSync: true });
+  await syncNow();
 }
 
 function lock(reason) {
@@ -157,7 +410,7 @@ let ENG = null;
 
 function cycleStats() {
   const p = S.data.profile;
-  const starts = [...new Set(S.data.periods.map((x) => x.start))].sort();
+  const starts = [...new Set(livePeriods().map((x) => x.start))].sort();
   const lens = [];
   for (let i = 1; i < starts.length; i++) {
     const l = diff(starts[i], starts[i - 1]);
@@ -220,7 +473,7 @@ function addFertility(c, st, actual) {
     c.fEnd = maxD(c.fEnd, addDays(c.start, st.max - L + 1));
     c.wide = true;
   }
-  const per = S.data.periods.find((x) => x.start === c.start);
+  const per = livePeriods().find((x) => x.start === c.start);
   c.pEnd = per && isDate(per.end) && per.end >= c.start ? per.end : addDays(c.start, Math.max(1, +p.periodLength || 5) - 1);
 }
 
@@ -402,7 +655,9 @@ function renderAuth(msg) {
       sess.data = normalise(sess.data);
       S = sess; failCount = 0; lastActivity = Date.now();
       view = 'today'; journalDate = today(); calMonth = today().slice(0, 7);
+      sync.status = 'off';
       render();
+      if (S.data.sync) syncNow();
     } catch {
       failCount++;
       if (failCount >= 5) { lockUntil = Date.now() + 30000 * (failCount - 4); }
@@ -413,7 +668,7 @@ function renderAuth(msg) {
   });
   document.getElementById('forgot').addEventListener('click', () => {
     const ok = prompt('Your data is encrypted with your password and cannot be recovered without it.\n\nIf you have a backup file you can restore it after resetting.\n\nType DELETE to erase this journal and start over:');
-    if (ok === 'DELETE') { localStorage.removeItem(VAULT_KEY); renderSetup(); toast('Journal erased'); }
+    if (ok === 'DELETE') { localStorage.removeItem(VAULT_KEY); setVer(0); clearDirty(); renderSetup(); toast('Journal erased'); }
   });
 }
 
@@ -436,7 +691,8 @@ function renderSetup() {
     <p class="note section">🔐 Your journal is encrypted with this password and stored only on this device. <b>There is no password reset</b> — if you forget it, the data can't be recovered. Keep regular backups (Settings → Backup).</p>
     <p class="err" id="err"></p>
     <button class="btn primary block" type="submit" id="createBtn">Create our private journal</button>
-    <p class="section"><label for="importFile" class="btn ghost small block" style="margin:0">Restore from a backup file instead</label>
+    <p class="section"><button type="button" class="btn block" id="joinBtn">📱 Join my partner's journal (sync)</button></p>
+    <p><label for="importFile" class="btn ghost small block" style="margin:0">Restore from a backup file instead</label>
     <input id="importFile" type="file" accept="application/json,.json" class="sr"></p>
   </form></div>`;
   document.getElementById('setupForm').addEventListener('submit', async (e) => {
@@ -464,6 +720,38 @@ function renderSetup() {
     toast('Your private journal is ready');
   });
   document.getElementById('importFile').addEventListener('change', importBackup);
+  document.getElementById('joinBtn').addEventListener('click', renderJoin);
+}
+
+function renderJoin() {
+  app.innerHTML = `
+  <div class="auth"><form class="card" id="joinForm" autocomplete="off">
+    <div style="font-size:2rem">📱💞📱</div>
+    <h1>Join your partner's journal</h1>
+    <p class="muted">On your partner's phone open <b>Settings → Sync between phones</b> and share the sync code. Then enter it here with the same journal password.</p>
+    <label for="jCode">Sync code</label>
+    <input id="jCode" required autocapitalize="off" spellcheck="false" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
+    <label for="jPw">Journal password</label>
+    <input id="jPw" type="password" autocomplete="current-password" required>
+    <p class="err" id="err"></p>
+    <button class="btn primary block" type="submit" id="jBtn">Join & sync</button>
+    <p class="section"><button type="button" class="btn ghost small block" id="jBack">← Back</button></p>
+  </form></div>`;
+  document.getElementById('jBack').addEventListener('click', renderSetup);
+  document.getElementById('joinForm').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('jBtn'), err = document.getElementById('err');
+    btn.disabled = true; btn.textContent = 'Connecting…'; err.textContent = '';
+    try {
+      await joinShared(document.getElementById('jCode').value, document.getElementById('jPw').value);
+      lastActivity = Date.now(); view = 'today';
+      render(); toast('Connected — your journals are now shared 💞');
+    } catch (ex) {
+      S = null;
+      err.textContent = ex.message || 'Could not connect.';
+      btn.disabled = false; btn.textContent = 'Join & sync';
+    }
+  });
 }
 
 function importBackup(e) {
@@ -476,6 +764,7 @@ function importBackup(e) {
       if (!(v && v.app === 'our-baby-plan' && v.ct && v.salt && v.iv && v.iter)) throw new Error('bad');
       if (loadVault() && !confirm('Replace the journal on this device with the backup? Current data here will be overwritten.')) return;
       localStorage.setItem(VAULT_KEY, JSON.stringify(v));
+      setVer(0); markDirty(); // a synced backup re-merges with the shared copy on unlock
       lock('Backup restored. Unlock it with the password that was used when the backup was made.');
     } catch { alert('That file is not a valid Our Baby Plan backup.'); }
   };
@@ -504,7 +793,7 @@ function render() {
   app.innerHTML = `
     <header class="topbar">
       <div class="brand"><span class="logo">👶</span><span>${names ? esc(names) : 'Our Baby Plan'}</span></div>
-      <button class="btn small" data-act="lock" aria-label="Lock journal">🔒 Lock</button>
+      <div class="row" style="gap:6px">${syncBadge()}<button class="btn small" data-act="lock" aria-label="Lock journal">🔒 Lock</button></div>
     </header>
     <nav class="nav" aria-label="Sections">
       ${TABS.map(([id, ic, label]) => `<button data-view="${id}" ${view === id ? 'aria-current="page"' : ''}><span class="ic" aria-hidden="true">${ic}</span>${label}</button>`).join('')}
@@ -646,7 +935,8 @@ function windowDays(c) {
 
 function habitsCard(date) {
   const p = S.data.profile;
-  const h = (S.data.days[date] && S.data.days[date].habits) || {};
+  const day = S.data.days[date] || {};
+  const h = Object.fromEntries([...HABITS.her, ...HABITS.him].map(([id]) => [id, !!day['hb_' + id]]));
   const col = (who, title) => {
     const list = HABITS[who];
     const n = list.filter(([id]) => h[id]).length;
@@ -675,7 +965,7 @@ function viewCalendar() {
   for (let i = 0; i < first.getDay(); i++) cells += '<div class="cell empty"></div>';
   for (let day = 1; day <= daysIn; day++) {
     const ds = `${y}-${pad(m)}-${pad(day)}`;
-    const info = S.data.periods.length ? dayInfo(ds) : null;
+    const info = livePeriods().length ? dayInfo(ds) : null;
     const d = S.data.days[ds] || {};
     const marks = [d.sex ? '💞' : '', d.opk === 'positive' || d.opk === 'peak' ? '🧪' : '', d.bbt ? '🌡' : '', d.test === 'positive' ? '🎉' : ''].join('');
     const cls = ['cell', info ? `lv-${info.level}` : '', info && info.c.kind === 'projected' ? 'proj' : '', ds === t ? 'today' : ''].join(' ');
@@ -724,9 +1014,9 @@ function viewJournal() {
   const ds = journalDate;
   const d = S.data.days[ds] || {};
   const p = S.data.profile;
-  const info = S.data.periods.length ? dayInfo(ds) : null;
+  const info = livePeriods().length ? dayInfo(ds) : null;
   const opts = (list, val) => list.map(([v, l]) => `<option value="${v}" ${v === (val || '') ? 'selected' : ''}>${esc(l)}</option>`).join('');
-  const isStart = S.data.periods.some((x) => x.start === ds);
+  const isStart = livePeriods().some((x) => x.start === ds);
   const unit = p.tempUnit === 'F' ? '°F' : '°C';
 
   return `<div class="stack section">
@@ -808,7 +1098,7 @@ function bbtChartCard(c) {
 }
 
 function periodLogCard() {
-  const list = [...S.data.periods].sort((a, b) => (a.start < b.start ? 1 : -1));
+  const list = livePeriods().sort((a, b) => (a.start < b.start ? 1 : -1));
   return `<div class="card"><h2>🩸 Period log</h2>
     <p class="muted" style="font-size:.9rem">Add the first day of each period. More history = better predictions.</p>
     <div class="row"><input type="date" id="newPeriod" max="${today()}" style="max-width:200px" aria-label="Period start date"><button class="btn" data-act="addPeriod">Add period</button></div>
@@ -840,7 +1130,8 @@ function weeklyScore(prefix) {
   const ids = HABITS[prefix].map((h) => h[0]);
   let done = 0;
   for (let i = 0; i < 7; i++) {
-    const h = (S.data.days[addDays(today(), -i)] || {}).habits || {};
+    const day = S.data.days[addDays(today(), -i)] || {};
+    const h = Object.fromEntries(ids.map((id) => [id, !!day['hb_' + id]]));
     done += ids.filter((id) => h[id]).length;
   }
   return Math.round((done / (ids.length * 7)) * 100);
@@ -850,7 +1141,7 @@ function viewPlan() {
   const p = S.data.profile;
   const her = esc(p.herName || 'Her');
   const him = esc(p.hisName || 'Him');
-  const info = S.data.periods.length ? dayInfo(today()) : null;
+  const info = livePeriods().length ? dayInfo(today()) : null;
   const phase = info ? info.level : null;
   const phaseTip = {
     period: ['Period phase', 'Gentle movement (walking, stretching, restorative yoga). Focus on iron: dal, rajma, spinach/palak, beetroot, dates, eggs or lean meat — with lemon/amla for vitamin C. Warm fluids and rest.'],
@@ -1027,6 +1318,8 @@ function viewSettings() {
       <button class="btn primary" type="submit">Change password</button>
     </form>
 
+    ${syncCard()}
+
     <div class="card">
       <h2>💾 Backup & move to another phone</h2>
       <p class="muted">The backup file is encrypted with your current password, so it's safe to keep in your email or cloud drive. To use the journal on another device, open the app there and choose "Restore from a backup file".</p>
@@ -1040,12 +1333,64 @@ function viewSettings() {
     <div class="card">
       <h2>Privacy</h2>
       <ul>
-        <li>Your data never leaves this device — the app has no server and blocks all network connections.</li>
+        <li>${S.data.sync ? 'Sync is on: only an encrypted copy is uploaded so your partner’s phone can read it. Nobody without the password — including the server — can read it.' : 'Sync is off: your data never leaves this device.'}</li>
         <li>Everything is encrypted (AES-256) with your password; it is never stored.</li>
         <li>The journal locks automatically after ${esc(p.autoLock)} min of inactivity. Tap 🔒 Lock when you put the phone down.</li>
         <li>Clearing browser data for this site deletes the journal — keep backups.</li>
       </ul>
       <button class="btn danger" data-act="wipe">Delete all data on this device</button>
+    </div>
+  </div>`;
+}
+
+function syncCard() {
+  const partner = 'your partner';
+  if (!S.data.sync) {
+    return `<div class="card">
+      <h2>📱 Sync between phones</h2>
+      <p>Share one journal on both your phones — entries, ticks and periods logged on either phone appear on the other within seconds.</p>
+      <ul class="muted" style="font-size:.9rem">
+        <li>Everything is encrypted on the phone with your journal password <b>before</b> it's uploaded. The server only stores scrambled data.</li>
+        <li>Both phones use the same journal password.</li>
+        <li>Works offline too — changes sync when you're back online.</li>
+      </ul>
+      <form id="syncOnForm" autocomplete="off">
+        <label for="syncPw">Confirm your journal password</label>
+        <input id="syncPw" type="password" autocomplete="current-password" required>
+        <p class="err" id="syncErr"></p>
+        <div class="row">
+          <button class="btn primary" type="submit" id="syncOnBtn">Turn on sync</button>
+        </div>
+      </form>
+      <details class="section"><summary>Already have a shared journal on ${partner}'s phone?</summary><div class="body">
+        <p class="muted" style="font-size:.9rem">Enter the sync code from the other phone and its journal password. Anything already on this phone will be merged in, and this phone will switch to that journal's password.</p>
+        <form id="joinHereForm" autocomplete="off">
+          <label for="jhCode">Sync code</label><input id="jhCode" required autocapitalize="off" spellcheck="false">
+          <label for="jhPw">Journal password (from the other phone)</label><input id="jhPw" type="password" required>
+          <p class="err" id="jhErr"></p>
+          <button class="btn" type="submit" id="jhBtn">Join & merge</button>
+        </form>
+      </div></details>
+    </div>`;
+  }
+  return `<div class="card">
+    <h2>📱 Sync between phones <span class="tag">On</span></h2>
+    <p id="syncState">${syncStateText()}</p>
+    ${sync.status === 'reconnect' ? `<form id="reconnectForm" autocomplete="off">
+        <label for="rcPw">New journal password</label><input id="rcPw" type="password" required>
+        <p class="err" id="rcErr"></p>
+        <button class="btn primary" type="submit" id="rcBtn">Reconnect</button></form>` : ''}
+    <label for="syncCode">Sync code — enter this on the other phone</label>
+    <div class="row">
+      <input id="syncCode" readonly value="${esc(S.data.sync.id)}" style="flex:1;min-width:0;font-family:ui-monospace,monospace;font-size:.85rem">
+      <button class="btn small" data-act="copyCode">Copy</button>
+      ${navigator.share ? '<button class="btn small" data-act="shareCode">Share</button>' : ''}
+    </div>
+    <p class="muted" style="font-size:.85rem">On the other phone: open the app → <b>Join my partner's journal</b> (or Settings → Sync → "Already have a shared journal?"), then enter this code and your journal password. The code alone can't open anything without the password.</p>
+    <div class="row section">
+      <button class="btn" data-act="syncNow">🔄 Sync now</button>
+      <button class="btn ghost" data-act="syncOff">Turn off on this phone</button>
+      <button class="btn ghost" data-act="syncDelete">Delete cloud copy</button>
     </div>
   </div>`;
 }
@@ -1060,10 +1405,12 @@ function entry(date) {
 
 function addPeriodStart(date) {
   if (!isDate(date) || date > today()) { toast('Choose a valid date'); return false; }
-  if (S.data.periods.some((x) => x.start === date)) { toast('Already logged'); return false; }
-  const near = S.data.periods.find((x) => Math.abs(diff(x.start, date)) < 10);
+  if (livePeriods().some((x) => x.start === date)) { toast('Already logged'); return false; }
+  const near = livePeriods().find((x) => Math.abs(diff(x.start, date)) < 10);
   if (near && !confirm(`There's already a period logged on ${nice(near.start)}. Add ${nice(date)} as a separate period anyway?`)) return false;
-  S.data.periods.push({ start: date });
+  const old = S.data.periods.find((x) => x.start === date);
+  if (old) { delete old.del; delete old.end; old._u = Date.now(); } // re-add a deleted one
+  else S.data.periods.push({ start: date, _u: Date.now() });
   S.data.periods.sort((a, b) => (a.start < b.start ? -1 : 1));
   return true;
 }
@@ -1077,10 +1424,11 @@ function afterRender() {
     e.preventDefault();
     const d = entry(journalDate);
     const val = (id) => document.getElementById(id).value.trim();
-    d.bbt = val('bbt'); d.mucus = val('mucus'); d.opk = val('opk'); d.test = val('test'); d.mood = val('mood'); d.weight = val('weight');
-    d.symptoms = [...jf.querySelectorAll('input[name=sym]:checked')].map((x) => x.value);
-    d.sex = document.getElementById('sex').checked;
-    d.herNotes = document.getElementById('herNotes').value; d.hisNotes = document.getElementById('hisNotes').value;
+    const upd = (k, v) => { if (JSON.stringify(d[k] ?? '') !== JSON.stringify(v)) setF(d, k, v); };
+    ['bbt', 'mucus', 'opk', 'test', 'mood', 'weight'].forEach((k) => upd(k, val(k)));
+    upd('symptoms', [...jf.querySelectorAll('input[name=sym]:checked')].map((x) => x.value));
+    upd('sex', document.getElementById('sex').checked);
+    upd('herNotes', document.getElementById('herNotes').value); upd('hisNotes', document.getElementById('hisNotes').value);
     save(); render(); toast(d.test === 'positive' ? 'Saved — congratulations! 🎉' : 'Entry saved');
   });
 
@@ -1089,7 +1437,7 @@ function afterRender() {
     e.preventDefault();
     const v = (id) => document.getElementById(id).value.trim();
     const clamp = (x, a, b, def) => Math.min(b, Math.max(a, +x || def));
-    Object.assign(S.data.profile, {
+    setMany(S.data.profile, {
       herName: v('sHer'), hisName: v('sHis'),
       herAge: clamp(v('sHerAge'), 18, 55, 36), hisAge: clamp(v('sHisAge'), 18, 70, 35),
       tryingSince: isDate(v('sTry')) ? v('sTry') : '',
@@ -1108,8 +1456,62 @@ function afterRender() {
     if (b !== c) { err.textContent = 'New passwords do not match.'; return; }
     try { await saveChain; await openVault(loadVault(), a); } catch { err.textContent = 'Current password is wrong.'; return; }
     const salt = crypto.getRandomValues(new Uint8Array(16));
-    S.key = await deriveKey(b, salt, PBKDF2_ITER); S.salt = salt; S.iter = PBKDF2_ITER;
-    await save(); pw.reset(); err.textContent = ''; toast('Password changed');
+    const newKey = await deriveKey(b, salt, PBKDF2_ITER);
+    if (S.data.sync) {
+      // re-encrypt the shared copy too, so the other phone must use the new password
+      if (!navigator.onLine) { err.textContent = 'Sync is on — connect to the internet to change the password.'; return; }
+      try {
+        const newToken = await syncToken(b, S.data.sync.id);
+        let ok = false;
+        for (let i = 0; i < 4 && !ok; i++) {
+          await syncNow();
+          if (sync.status !== 'ok') throw new Error('Could not sync first. Try again in a moment.');
+          const data = JSON.parse(JSON.stringify(S.data));
+          data.sync.token = newToken;
+          const v = await sealVault(newKey, salt, PBKDF2_ITER, data);
+          const nv = await rpc('journey_push', { p_id: S.data.sync.id, p_token: S.data.sync.token, p_expected: getVer(), p_salt: v.salt, p_iter: v.iter, p_iv: v.iv, p_ct: v.ct, p_new_token: newToken });
+          if (nv > 0) { ok = true; setVer(nv); S.data.sync.token = newToken; }
+        }
+        if (!ok) throw new Error('The other phone is busy saving. Try again in a moment.');
+      } catch (ex) { err.textContent = ex.message || 'Could not update the shared journal.'; return; }
+    }
+    S.key = newKey; S.salt = salt; S.iter = PBKDF2_ITER;
+    await save({ fromSync: true }); pw.reset(); err.textContent = '';
+    toast(S.data.sync ? 'Password changed — use the new password on the other phone too' : 'Password changed');
+  });
+
+  const so = document.getElementById('syncOnForm');
+  if (so) so.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('syncOnBtn'), err = document.getElementById('syncErr');
+    btn.disabled = true; btn.textContent = 'Turning on…'; err.textContent = '';
+    try { await saveChain; await enableSync(document.getElementById('syncPw').value); render(); toast('Sync is on — now join from the other phone'); }
+    catch (ex) {
+      err.textContent = ex.name === 'OperationError' ? 'Wrong password.' : !navigator.onLine ? 'No internet connection.' : ex.message || 'Could not turn on sync.';
+      if (S.data.sync && getVer() === 0) delete S.data.sync;
+      btn.disabled = false; btn.textContent = 'Turn on sync';
+    }
+  });
+
+  const jh = document.getElementById('joinHereForm');
+  if (jh) jh.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('jhBtn'), err = document.getElementById('jhErr');
+    if (!confirm('Merge this phone\'s journal into the shared one? This phone will then use the shared journal\'s password.')) return;
+    btn.disabled = true; btn.textContent = 'Connecting…'; err.textContent = '';
+    const prev = S;
+    try { await saveChain; await joinShared(document.getElementById('jhCode').value, document.getElementById('jhPw').value); render(); toast('Connected — journals merged 💞'); }
+    catch (ex) { S = prev; err.textContent = ex.message || 'Could not connect.'; btn.disabled = false; btn.textContent = 'Join & merge'; }
+  });
+
+  const rc = document.getElementById('reconnectForm');
+  if (rc) rc.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const btn = document.getElementById('rcBtn'), err = document.getElementById('rcErr');
+    btn.disabled = true; btn.textContent = 'Reconnecting…'; err.textContent = '';
+    const prev = S;
+    try { await joinShared(S.data.sync.id, document.getElementById('rcPw').value); render(); toast('Reconnected — use the new password to unlock from now on'); }
+    catch (ex) { S = prev; err.textContent = ex.message || 'Could not reconnect.'; btn.disabled = false; btn.textContent = 'Reconnect'; }
   });
 
   const imp = document.getElementById('importFile2');
@@ -1134,13 +1536,12 @@ app.addEventListener('change', (e) => {
   if (!S) return;
   if (el.dataset.habit) {
     const d = entry(el.dataset.date);
-    d.habits = d.habits || {};
-    if (el.checked) d.habits[el.dataset.habit] = true; else delete d.habits[el.dataset.habit];
+    setF(d, 'hb_' + el.dataset.habit, el.checked);
     save();
     const card = el.closest('.card');
     if (card) card.outerHTML = habitsCard(el.dataset.date);
   } else if (el.dataset.check) {
-    if (el.checked) S.data.checklist[el.dataset.check] = true; else delete S.data.checklist[el.dataset.check];
+    setF(S.data.checklist, el.dataset.check, el.checked);
     save(); render();
   }
 });
@@ -1159,28 +1560,51 @@ app.addEventListener('click', async (e) => {
       if (addPeriodStart(v)) { save(); render(); toast('Saved — predictions are ready'); }
       break;
     }
-    case 'toggleSex': { const d = entry(t); d.sex = !d.sex; save(); render(); toast(d.sex ? 'Logged 💞' : 'Removed'); break; }
-    case 'opkPos': { const d = entry(t); d.opk = d.opk === 'positive' ? '' : 'positive'; save(); render(); toast(d.opk ? 'Positive OPK — ovulation likely in 12–36 h. Try today & tomorrow!' : 'Removed'); break; }
-    case 'eggwhite': { const d = entry(t); d.mucus = d.mucus === 'eggwhite' ? '' : 'eggwhite'; save(); render(); toast(d.mucus ? 'Logged — very fertile sign!' : 'Removed'); break; }
+    case 'toggleSex': { const d = entry(t); setF(d, 'sex', !d.sex); save(); render(); toast(d.sex ? 'Logged 💞' : 'Removed'); break; }
+    case 'opkPos': { const d = entry(t); setF(d, 'opk', d.opk === 'positive' ? '' : 'positive'); save(); render(); toast(d.opk ? 'Positive OPK — ovulation likely in 12–36 h. Try today & tomorrow!' : 'Removed'); break; }
+    case 'eggwhite': { const d = entry(t); setF(d, 'mucus', d.mucus === 'eggwhite' ? '' : 'eggwhite'); save(); render(); toast(d.mucus ? 'Logged — very fertile sign!' : 'Removed'); break; }
     case 'periodToday': if (addPeriodStart(t)) { save(); render(); toast('New cycle started'); } break;
     case 'openJournal': journalDate = b.dataset.date; go('journal'); break;
     case 'jPrev': journalDate = addDays(journalDate, -1); render(); break;
     case 'jNext': journalDate = addDays(journalDate, 1); render(); break;
     case 'markPeriod': if (addPeriodStart(journalDate)) { save(); render(); toast('Period start saved'); } break;
-    case 'unmarkPeriod': S.data.periods = S.data.periods.filter((x) => x.start !== journalDate); save(); render(); toast('Removed'); break;
+    case 'unmarkPeriod': removePeriod(journalDate); save(); render(); toast('Removed'); break;
     case 'markPeriodEnd': {
-      const p = [...S.data.periods].filter((x) => x.start <= journalDate).sort((a, b2) => (a.start < b2.start ? 1 : -1))[0];
+      const p = livePeriods().filter((x) => x.start <= journalDate).sort((a, b2) => (a.start < b2.start ? 1 : -1))[0];
       if (!p || diff(journalDate, p.start) > 12) { toast('Log the period start first'); break; }
-      p.end = journalDate; save(); render(); toast('Period end saved');
+      p.end = journalDate; p._u = Date.now(); save(); render(); toast('Period end saved');
       break;
     }
     case 'addPeriod': { const v = document.getElementById('newPeriod').value; if (addPeriodStart(v)) { save(); render(); toast('Period added'); } break; }
-    case 'delPeriod': if (confirm(`Delete period starting ${nice(b.dataset.date)}?`)) { S.data.periods = S.data.periods.filter((x) => x.start !== b.dataset.date); save(); render(); } break;
+    case 'delPeriod': if (confirm(`Delete period starting ${nice(b.dataset.date)}?`)) { removePeriod(b.dataset.date); save(); render(); } break;
     case 'calPrev': case 'calNext': {
       const [y, m] = calMonth.split('-').map(Number);
       const d = new Date(y, m - 1 + (act === 'calNext' ? 1 : -1), 1, 12);
       calMonth = iso(d).slice(0, 7); render(); break;
     }
+    case 'copyCode': {
+      const code = S.data.sync && S.data.sync.id;
+      try { await navigator.clipboard.writeText(code); toast('Sync code copied'); }
+      catch { const i = document.getElementById('syncCode'); i.select(); toast('Select and copy the code'); }
+      break;
+    }
+    case 'shareCode':
+      try { await navigator.share({ title: 'Our Baby Plan sync code', text: `Sync code for our journal: ${S.data.sync.id}` }); } catch { /* cancelled */ }
+      break;
+    case 'syncNow': sync.status = sync.status === 'reconnect' ? 'reconnect' : 'off'; await syncNow(); render(); break;
+    case 'syncOff':
+      if (confirm('Stop syncing on this phone? Your journal stays on this phone and the shared copy stays for the other phone.')) {
+        delete S.data.sync; setVer(0); clearDirty(); sync.status = 'off'; await save({ fromSync: true }); render(); toast('Sync turned off on this phone');
+      }
+      break;
+    case 'syncDelete':
+      if (confirm('Delete the shared cloud copy? Both phones keep their own journal, but they will stop syncing.')) {
+        try {
+          await rpc('journey_delete', { p_id: S.data.sync.id, p_token: S.data.sync.token });
+          delete S.data.sync; setVer(0); clearDirty(); sync.status = 'off'; await save({ fromSync: true }); render(); toast('Cloud copy deleted');
+        } catch (ex) { toast(navigator.onLine ? (ex.message || 'Could not delete') : 'No internet connection'); }
+      }
+      break;
     case 'calToday': calMonth = t.slice(0, 7); render(); break;
     case 'export': {
       await saveChain;
@@ -1194,7 +1618,7 @@ app.addEventListener('click', async (e) => {
     }
     case 'wipe':
       if (prompt('This permanently deletes the journal from this device.\nType DELETE to confirm:') === 'DELETE') {
-        localStorage.removeItem(VAULT_KEY); S = null; renderSetup(); toast('All data deleted');
+        localStorage.removeItem(VAULT_KEY); setVer(0); clearDirty(); S = null; renderSetup(); toast('All data deleted on this phone');
       }
       break;
     default: break;
