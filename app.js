@@ -536,7 +536,10 @@ if (pendingJoin) history.replaceState(null, '', location.pathname + location.sea
 /** Join (or reconnect to) a shared journal, merging in anything already on this phone. */
 async function joinShared(code, password) {
   const r = await fetchShared(code, password);
+  const joiningOther = S && !(S.data.sync && S.data.sync.id === r.id);
   const merged = S ? mergeData(S.data, r.data) : r.data;
+  // Joining someone else's journal: their names/ages/cycle settings win; entries still merge.
+  if (joiningOther) merged.profile = r.data.profile;
   merged.sync = { id: r.id, token: r.token };
   S = { key: r.key, salt: r.salt, iter: r.iter, data: merged };
   setVer(r.version);
@@ -1459,6 +1462,8 @@ function viewChecklist() {
 function viewSettings() {
   const p = S.data.profile;
   return `<div class="stack section">
+    ${syncCard()}
+
     <form class="card" id="profileForm" autocomplete="off">
       <h2>Profile & cycle</h2>
       <div class="fields">
@@ -1486,8 +1491,6 @@ function viewSettings() {
       <button class="btn primary" type="submit">Change password</button>
     </form>
 
-    ${syncCard()}
-
     <div class="card">
       <h2>💾 Backup & move to another phone</h2>
       <p class="muted">The backup file is encrypted with your current password, so it's safe to keep in your email or cloud drive. To use the journal on another device, open the app there and choose "Restore from a backup file".</p>
@@ -1512,35 +1515,39 @@ function viewSettings() {
 }
 
 function syncCard() {
-  const partner = 'your partner';
   if (!S.data.sync) {
-    return `<div class="card">
+    return `<div class="card" id="syncCard">
       <h2>📱 Sync between phones</h2>
-      <p>Share one journal on both your phones — entries, ticks and periods logged on either phone appear on the other within seconds.</p>
-      <ul class="muted" style="font-size:.9rem">
-        <li>Everything is encrypted on the phone with your journal password <b>before</b> it's uploaded. The server only stores scrambled data.</li>
-        <li>Both phones use the same journal password.</li>
-        <li>Works offline too — changes sync when you're back online.</li>
-      </ul>
-      <form id="syncOnForm" autocomplete="off">
-        <p class="muted" style="font-size:.9rem">After turning it on you'll get a QR code — scan it from your partner's phone.</p>
-      <label for="syncPw">Confirm your journal password</label>
-        <input id="syncPw" type="password" autocomplete="current-password" required>
-        <p class="err" id="syncErr"></p>
-        <div class="row">
-          <button class="btn primary" type="submit" id="syncOnBtn">Turn on sync</button>
-        </div>
-      </form>
-      <details class="section" ${pendingJoin ? 'open' : ''}><summary>Already have a shared journal on ${partner}'s phone?</summary><div class="body">
-        <p class="muted" style="font-size:.9rem">Enter the sync code from the other phone and its journal password. Anything already on this phone will be merged in, and this phone will switch to that journal's password.</p>
+      <p class="muted" style="font-size:.9rem">Share one journal on both phones. Everything is encrypted with your journal password before it leaves the phone, and it works offline too.</p>
+
+      <div class="choice">
+        <h3>📷 Join your partner's journal</h3>
+        <p class="muted" style="font-size:.9rem">Use this if sync is already on on the other phone. There, open <b>Settings → Sync → Show QR</b>.</p>
         <form id="joinHereForm" autocomplete="off">
-          <label for="jhCode">Sync code</label><input id="jhCode" required autocapitalize="off" spellcheck="false" placeholder="Scan the QR or paste the code" value="${esc(pendingJoin || '')}">
-          ${qrInputButtons('jhCode')}
-          <label for="jhPw">Journal password (from the other phone)</label><input id="jhPw" type="password" required>
+          <div class="row">
+            <button type="button" class="btn primary" data-act="scanInto" data-target="jhCode">📷 Scan QR</button>
+            <label class="btn" style="margin:0">🖼 Upload QR image<input type="file" accept="image/*" class="sr" data-qrfile="jhCode"></label>
+          </div>
+          <label for="jhCode">Sync code (filled in by the QR, or paste it)</label>
+          <input id="jhCode" required autocapitalize="off" spellcheck="false" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx" value="${esc(pendingJoin || '')}">
+          <label for="jhPw">Journal password (the one used on the other phone)</label>
+          <input id="jhPw" type="password" required>
           <p class="err" id="jhErr"></p>
           <button class="btn" type="submit" id="jhBtn">Join & merge</button>
+          <p class="muted" style="font-size:.8rem;margin-top:8px">Anything already on this phone is merged in, and this phone switches to the shared journal's password.</p>
         </form>
-      </div></details>
+      </div>
+
+      <div class="choice">
+        <h3>🔳 Start sharing from this phone</h3>
+        <p class="muted" style="font-size:.9rem">Use this on the first phone. You'll then get a QR code to scan from your partner's phone.</p>
+        <form id="syncOnForm" autocomplete="off">
+          <label for="syncPw">Confirm your journal password</label>
+          <input id="syncPw" type="password" autocomplete="current-password" required>
+          <p class="err" id="syncErr"></p>
+          <button class="btn primary" type="submit" id="syncOnBtn">Turn on sync & show QR</button>
+        </form>
+      </div>
     </div>`;
   }
   return `<div class="card">
@@ -1663,7 +1670,7 @@ function afterRender() {
     e.preventDefault();
     const btn = document.getElementById('syncOnBtn'), err = document.getElementById('syncErr');
     btn.disabled = true; btn.textContent = 'Turning on…'; err.textContent = '';
-    try { await saveChain; await enableSync(document.getElementById('syncPw').value); render(); toast('Sync is on — now join from the other phone'); }
+    try { await saveChain; await enableSync(document.getElementById('syncPw').value); render(); toast('Sync is on — scan this QR from the other phone'); const q = document.querySelector('[data-act=showQR]'); if (q) { q.click(); q.scrollIntoView({ block: 'start' }); } }
     catch (ex) {
       err.textContent = ex.name === 'OperationError' ? 'Wrong password.' : !navigator.onLine ? 'No internet connection.' : ex.message || 'Could not turn on sync.';
       if (S.data.sync && getVer() === 0) delete S.data.sync;

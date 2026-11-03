@@ -256,3 +256,5 @@ details > .body { padding: 0 16px 14px; }
 .scan-box video { width: 100%; height: 100%; object-fit: cover; display: block; }
 .scan-frame { position: absolute; inset: 14%; border: 3px solid rgba(255, 255, 255, .9); border-radius: 16px; box-shadow: 0 0 0 999px rgba(0, 0, 0, .25); }
 .scan-msg { text-align: center; max-width: 340px; margin: 0; }
+.choice { border: 1px solid var(--border); border-radius: 12px; padding: 14px; margin-top: 12px; background: var(--surface-2); }
+.choice h3 { margin-bottom: 4px; }
