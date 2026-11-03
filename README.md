@@ -10,7 +10,7 @@ A private, password-protected conception journal for couples: it predicts the fe
 - **Daily journal:** temperature, mucus, ovulation test, pregnancy test, mood, symptoms, intercourse, notes from both partners, temperature chart.
 - **Diet & fitness:** nutrients for her & him, foods to avoid, 7-day Indian meal plan (veg + non-veg swaps), supplements to discuss with your doctor, weekly exercise plan, BMI check, daily habit checklist & weekly score.
 - **Pre-conception checklist** (tests, vaccines, screening, insurance) and a "months trying" tracker that tells you when to see a specialist (6 months when she is 35+).
-- **Sync between both phones:** turn it on in Settings → *Sync between phones*, then on the other phone choose *Join my partner's journal* and enter the sync code + the same journal password. Changes from either phone merge field-by-field (newest wins) within seconds, and work offline.
+- **Sync between both phones:** turn it on in Settings → *Sync between phones* and tap **Show QR**. On the other phone choose *Join my partner's journal* → **Scan QR** (camera) or **Upload QR image** (screenshot) — or just point the phone's normal camera at the QR — then enter the same journal password. The text sync code (Copy/Share) still works too. Changes from either phone merge field-by-field (newest wins) within seconds, and work offline.
   End-to-end encrypted: only ciphertext is stored in Supabase (`journey_vaults` table, reachable only through `journey_pull` / `journey_push` / `journey_delete` functions that check a password-derived token).
 - **Encrypted backup/restore** to move to another phone.
 
@@ -22,3 +22,8 @@ Open `index.html` in a browser, or host free on **GitHub Pages** (Settings → P
 > ⚠️ There is no password reset. If you forget it, the data can't be recovered — download backups regularly.
 
 Predictions are estimates, not medical advice and not contraception. Please see your doctor.
+
+## Third-party code
+Bundled in `vendor/` and loaded only when a QR code is shown or scanned:
+- [qrcode-generator](https://github.com/kazuhikoarase/qrcode-generator) 1.4.4 — MIT, © Kazuhiko Arase
+- [jsQR](https://github.com/cozmo/jsQR) 1.4.0 — Apache-2.0 (see `vendor/jsQR-LICENSE.txt`)

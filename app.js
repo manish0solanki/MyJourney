@@ -372,6 +372,167 @@ async function fetchShared(code, password) {
   return { key, salt, iter: row.iter, data: normalise(data), version: row.version, id, token };
 }
 
+/* =========================================================
+ * QR codes for the sync code (show / scan with camera / upload image)
+ * Libraries are bundled in /vendor and only loaded when needed.
+ * ======================================================= */
+const UUID_RE = /[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/i;
+const loaded = {};
+function loadScript(src) {
+  if (!loaded[src]) {
+    loaded[src] = new Promise((res, rej) => {
+      const s = document.createElement('script');
+      s.src = src; s.onload = res; s.onerror = () => { delete loaded[src]; rej(new Error('Could not load QR tools — check your connection.')); };
+      document.head.appendChild(s);
+    });
+  }
+  return loaded[src];
+}
+
+/** The QR holds a link to this app, so even the phone's normal camera app opens the join screen. */
+function qrPayload(id) {
+  return /^https?:$/.test(location.protocol) ? `${location.origin}${location.pathname}#join=${id}` : id;
+}
+const codeFrom = (text) => { const m = String(text || '').match(UUID_RE); return m ? m[0].toLowerCase() : null; };
+
+async function qrSvg(text) {
+  await loadScript('vendor/qrcode-generator-1.4.4.js');
+  const qr = window.qrcode(0, 'M');
+  qr.addData(text); qr.make();
+  return qr.createSvgTag({ cellSize: 6, margin: 4, scalable: true, alt: 'Sync QR code' });
+}
+
+async function qrPngBlob(text) {
+  await loadScript('vendor/qrcode-generator-1.4.4.js');
+  const qr = window.qrcode(0, 'M');
+  qr.addData(text); qr.make();
+  const n = qr.getModuleCount(), cell = 10, margin = 4, size = (n + margin * 2) * cell;
+  const c = document.createElement('canvas');
+  c.width = size; c.height = size + 60;
+  const g = c.getContext('2d');
+  g.fillStyle = '#fff'; g.fillRect(0, 0, c.width, c.height);
+  g.fillStyle = '#000';
+  for (let r = 0; r < n; r++) for (let col = 0; col < n; col++) if (qr.isDark(r, col)) g.fillRect((col + margin) * cell, (r + margin) * cell, cell, cell);
+  g.font = 'bold 22px system-ui, sans-serif'; g.textAlign = 'center';
+  g.fillText('Our Baby Plan — sync code', size / 2, size + 36);
+  return new Promise((res) => c.toBlob(res, 'image/png'));
+}
+
+let barcodeDetector = null;
+async function detectQR(source, width, height, thorough) {
+  if ('BarcodeDetector' in window) {
+    try {
+      barcodeDetector = barcodeDetector || new window.BarcodeDetector({ formats: ['qr_code'] });
+      const found = await barcodeDetector.detect(source);
+      if (found.length) return found[0].rawValue;
+      if (!thorough) return null;
+    } catch { barcodeDetector = null; /* not supported here — use jsQR */ }
+  }
+  await loadScript('vendor/jsQR-1.4.0.js');
+  const scale = Math.min(1, 900 / Math.max(width, height));
+  const w = Math.max(1, Math.round(width * scale)), h = Math.max(1, Math.round(height * scale));
+  const c = detectQR.canvas || (detectQR.canvas = document.createElement('canvas'));
+  c.width = w; c.height = h;
+  const g = c.getContext('2d', { willReadFrequently: true });
+  g.drawImage(source, 0, 0, w, h);
+  const r = window.jsQR(g.getImageData(0, 0, w, h).data, w, h, { inversionAttempts: thorough ? 'attemptBoth' : 'dontInvert' });
+  return r ? r.data : null;
+}
+
+async function decodeImageFile(file) {
+  let img;
+  try { img = await createImageBitmap(file); }
+  catch { throw new Error('Could not open that image.'); }
+  const text = await detectQR(img, img.width, img.height, true);
+  if (img.close) img.close();
+  const code = codeFrom(text);
+  if (!code) throw new Error('No sync QR code found in that image. Try a clearer screenshot.');
+  return code;
+}
+
+/** Full-screen camera scanner. Resolves with the sync code, or null if cancelled. */
+function scanQR() {
+  return new Promise((resolve) => {
+    const ov = document.createElement('div');
+    ov.className = 'scanner';
+    ov.setAttribute('role', 'dialog');
+    ov.setAttribute('aria-label', 'Scan sync QR code');
+    ov.innerHTML = `
+      <div class="scan-box">
+        <video playsinline muted autoplay></video>
+        <div class="scan-frame" aria-hidden="true"></div>
+      </div>
+      <p class="scan-msg">Starting camera…</p>
+      <div class="row" style="justify-content:center">
+        <label class="btn" style="margin:0">🖼 Upload QR image<input type="file" accept="image/*" class="sr"></label>
+        <button class="btn" type="button" data-x="cancel">Cancel</button>
+      </div>`;
+    document.body.appendChild(ov);
+    const video = ov.querySelector('video'), msg = ov.querySelector('.scan-msg');
+    let stream = null, done = false;
+    const finish = (code) => {
+      if (done) return; done = true;
+      if (stream) stream.getTracks().forEach((t) => t.stop());
+      ov.remove();
+      resolve(code);
+    };
+    ov.querySelector('[data-x=cancel]').addEventListener('click', () => finish(null));
+    ov.querySelector('input[type=file]').addEventListener('change', async (e) => {
+      const f = e.target.files && e.target.files[0];
+      if (!f) return;
+      msg.textContent = 'Reading image…';
+      try { finish(await decodeImageFile(f)); } catch (ex) { msg.textContent = ex.message; }
+    });
+    const tick = async () => {
+      if (done) return;
+      if (video.readyState >= 2 && video.videoWidth) {
+        try {
+          const code = codeFrom(await detectQR(video, video.videoWidth, video.videoHeight, false));
+          if (code) { if (navigator.vibrate) navigator.vibrate(60); finish(code); return; }
+        } catch (ex) { msg.textContent = ex.message; }
+      }
+      setTimeout(tick, 200);
+    };
+    if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+      msg.textContent = 'Camera isn’t available here — upload a screenshot of the QR instead.';
+      return;
+    }
+    navigator.mediaDevices.getUserMedia({ video: { facingMode: 'environment' }, audio: false })
+      .then((s) => {
+        if (done) { s.getTracks().forEach((t) => t.stop()); return; }
+        stream = s; video.srcObject = s;
+        msg.textContent = 'Point the camera at the QR code on the other phone.';
+        tick();
+      })
+      .catch(() => { msg.textContent = 'Camera permission was denied or no camera found. You can upload a screenshot of the QR instead.'; });
+  });
+}
+
+/** Adds Scan / Upload buttons next to a sync-code input. */
+function qrInputButtons(inputId) {
+  return `<div class="row" style="margin-top:8px">
+    <button type="button" class="btn small" data-act="scanInto" data-target="${inputId}">📷 Scan QR</button>
+    <label class="btn small" style="margin:0">🖼 Upload QR image<input type="file" accept="image/*" class="sr" data-qrfile="${inputId}"></label>
+  </div>`;
+}
+
+async function fillFromScan(inputId, getCode) {
+  const input = document.getElementById(inputId);
+  try {
+    const code = await getCode();
+    if (!code || !input) return;
+    input.value = code;
+    toast('Sync code filled in ✓ — now enter the journal password');
+    const form = input.closest('form');
+    const pw = form && form.querySelector('input[type=password]');
+    if (pw) pw.focus();
+  } catch (ex) { toast(ex.message || 'Could not read the QR code'); }
+}
+
+// QR links (#join=<code>) opened with the phone's normal camera
+let pendingJoin = codeFrom((location.hash.match(/join=([^&]+)/) || [])[1]);
+if (pendingJoin) history.replaceState(null, '', location.pathname + location.search);
+
 /** Join (or reconnect to) a shared journal, merging in anything already on this phone. */
 async function joinShared(code, password) {
   const r = await fetchShared(code, password);
@@ -656,6 +817,10 @@ function renderAuth(msg) {
       S = sess; failCount = 0; lastActivity = Date.now();
       view = 'today'; journalDate = today(); calMonth = today().slice(0, 7);
       sync.status = 'off';
+      if (pendingJoin) {
+        if (S.data.sync && S.data.sync.id === pendingJoin) { pendingJoin = null; toast('This phone is already connected to that journal ✓'); }
+        else view = 'settings';
+      }
       render();
       if (S.data.sync) syncNow();
     } catch {
@@ -673,6 +838,7 @@ function renderAuth(msg) {
 }
 
 function renderSetup() {
+  if (pendingJoin) { renderJoin(); return; }
   app.innerHTML = `
   <div class="auth"><form class="card" id="setupForm" autocomplete="off">
     <div style="font-size:2rem">👶💞</div>
@@ -728,15 +894,17 @@ function renderJoin() {
   <div class="auth"><form class="card" id="joinForm" autocomplete="off">
     <div style="font-size:2rem">📱💞📱</div>
     <h1>Join your partner's journal</h1>
-    <p class="muted">On your partner's phone open <b>Settings → Sync between phones</b> and share the sync code. Then enter it here with the same journal password.</p>
+    <p class="muted">On your partner's phone open <b>Settings → Sync between phones → Show QR</b>. Scan it here (or paste the code), then enter the same journal password.</p>
     <label for="jCode">Sync code</label>
-    <input id="jCode" required autocapitalize="off" spellcheck="false" placeholder="xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx">
+    <input id="jCode" required autocapitalize="off" spellcheck="false" placeholder="Scan the QR or paste the code" value="${esc(pendingJoin || '')}">
+    ${qrInputButtons('jCode')}
     <label for="jPw">Journal password</label>
     <input id="jPw" type="password" autocomplete="current-password" required>
     <p class="err" id="err"></p>
     <button class="btn primary block" type="submit" id="jBtn">Join & sync</button>
     <p class="section"><button type="button" class="btn ghost small block" id="jBack">← Back</button></p>
   </form></div>`;
+  pendingJoin = null;
   document.getElementById('jBack').addEventListener('click', renderSetup);
   document.getElementById('joinForm').addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -1355,17 +1523,19 @@ function syncCard() {
         <li>Works offline too — changes sync when you're back online.</li>
       </ul>
       <form id="syncOnForm" autocomplete="off">
-        <label for="syncPw">Confirm your journal password</label>
+        <p class="muted" style="font-size:.9rem">After turning it on you'll get a QR code — scan it from your partner's phone.</p>
+      <label for="syncPw">Confirm your journal password</label>
         <input id="syncPw" type="password" autocomplete="current-password" required>
         <p class="err" id="syncErr"></p>
         <div class="row">
           <button class="btn primary" type="submit" id="syncOnBtn">Turn on sync</button>
         </div>
       </form>
-      <details class="section"><summary>Already have a shared journal on ${partner}'s phone?</summary><div class="body">
+      <details class="section" ${pendingJoin ? 'open' : ''}><summary>Already have a shared journal on ${partner}'s phone?</summary><div class="body">
         <p class="muted" style="font-size:.9rem">Enter the sync code from the other phone and its journal password. Anything already on this phone will be merged in, and this phone will switch to that journal's password.</p>
         <form id="joinHereForm" autocomplete="off">
-          <label for="jhCode">Sync code</label><input id="jhCode" required autocapitalize="off" spellcheck="false">
+          <label for="jhCode">Sync code</label><input id="jhCode" required autocapitalize="off" spellcheck="false" placeholder="Scan the QR or paste the code" value="${esc(pendingJoin || '')}">
+          ${qrInputButtons('jhCode')}
           <label for="jhPw">Journal password (from the other phone)</label><input id="jhPw" type="password" required>
           <p class="err" id="jhErr"></p>
           <button class="btn" type="submit" id="jhBtn">Join & merge</button>
@@ -1380,13 +1550,17 @@ function syncCard() {
         <label for="rcPw">New journal password</label><input id="rcPw" type="password" required>
         <p class="err" id="rcErr"></p>
         <button class="btn primary" type="submit" id="rcBtn">Reconnect</button></form>` : ''}
-    <label for="syncCode">Sync code — enter this on the other phone</label>
+    <div class="qr-wrap">
+      <button class="btn primary" data-act="showQR" aria-expanded="false" aria-controls="qrBox">🔳 Show QR</button>
+      <div id="qrBox" class="qr-box" hidden></div>
+    </div>
+    <label for="syncCode">Or share the sync code as text</label>
     <div class="row">
       <input id="syncCode" readonly value="${esc(S.data.sync.id)}" style="flex:1;min-width:0;font-family:ui-monospace,monospace;font-size:.85rem">
       <button class="btn small" data-act="copyCode">Copy</button>
       ${navigator.share ? '<button class="btn small" data-act="shareCode">Share</button>' : ''}
     </div>
-    <p class="muted" style="font-size:.85rem">On the other phone: open the app → <b>Join my partner's journal</b> (or Settings → Sync → "Already have a shared journal?"), then enter this code and your journal password. The code alone can't open anything without the password.</p>
+    <p class="muted" style="font-size:.85rem">On the other phone: open the app → <b>Join my partner's journal</b> → <b>Scan QR</b> (or point its normal camera at the QR), then enter your journal password. The QR/code alone can't open anything without the password.</p>
     <div class="row section">
       <button class="btn" data-act="syncNow">🔄 Sync now</button>
       <button class="btn ghost" data-act="syncOff">Turn off on this phone</button>
@@ -1480,6 +1654,10 @@ function afterRender() {
     toast(S.data.sync ? 'Password changed — use the new password on the other phone too' : 'Password changed');
   });
 
+  if (view === 'settings' && pendingJoin && document.getElementById('jhCode')) {
+    toast('Sync code filled in from the QR — enter the journal password from the other phone');
+    pendingJoin = null;
+  }
   const so = document.getElementById('syncOnForm');
   if (so) so.addEventListener('submit', async (e) => {
     e.preventDefault();
@@ -1533,6 +1711,12 @@ function afterRender() {
 
 app.addEventListener('change', (e) => {
   const el = e.target;
+  if (el.dataset.qrfile) {
+    const f = el.files && el.files[0];
+    el.value = '';
+    if (f) fillFromScan(el.dataset.qrfile, () => decodeImageFile(f));
+    return;
+  }
   if (!S) return;
   if (el.dataset.habit) {
     const d = entry(el.dataset.date);
@@ -1550,6 +1734,7 @@ app.addEventListener('click', async (e) => {
   const navBtn = e.target.closest('[data-view]');
   if (navBtn && S) { go(navBtn.dataset.view); return; }
   const b = e.target.closest('[data-act]');
+  if (b && b.dataset.act === 'scanInto') { fillFromScan(b.dataset.target, scanQR); return; }
   if (!b || !S) return;
   const act = b.dataset.act;
   const t = today();
@@ -1581,6 +1766,33 @@ app.addEventListener('click', async (e) => {
       const [y, m] = calMonth.split('-').map(Number);
       const d = new Date(y, m - 1 + (act === 'calNext' ? 1 : -1), 1, 12);
       calMonth = iso(d).slice(0, 7); render(); break;
+    }
+    case 'showQR': {
+      const box = document.getElementById('qrBox');
+      if (!box.hidden) { box.hidden = true; b.textContent = '🔳 Show QR'; b.setAttribute('aria-expanded', 'false'); break; }
+      try {
+        box.innerHTML = `<div class="qr-img">${await qrSvg(qrPayload(S.data.sync.id))}</div>
+          <p class="muted" style="font-size:.85rem;margin:8px 0">Scan this from your partner's phone. Only works together with your journal password.</p>
+          <button class="btn small" data-act="saveQR">⬇️ Save / share QR image</button>`;
+        box.hidden = false; b.textContent = 'Hide QR'; b.setAttribute('aria-expanded', 'true');
+      } catch (ex) { toast(ex.message); }
+      break;
+    }
+    case 'saveQR': {
+      try {
+        const blob = await qrPngBlob(qrPayload(S.data.sync.id));
+        const file = new File([blob], 'our-baby-plan-sync-qr.png', { type: 'image/png' });
+        if (navigator.canShare && navigator.canShare({ files: [file] })) {
+          try { await navigator.share({ files: [file], title: 'Our Baby Plan sync QR' }); } catch { /* cancelled */ }
+        } else {
+          const a = document.createElement('a');
+          a.href = URL.createObjectURL(blob); a.download = file.name;
+          document.body.appendChild(a); a.click(); a.remove();
+          setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+          toast('QR image saved');
+        }
+      } catch (ex) { toast(ex.message || 'Could not create the image'); }
+      break;
     }
     case 'copyCode': {
       const code = S.data.sync && S.data.sync.id;
